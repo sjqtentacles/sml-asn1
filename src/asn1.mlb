@@ -1,0 +1,9 @@
+(* MLB for the sml-asn1 library: the vendored sml-bigint core plus the asn1
+ * sources.  Consumers reference this file.
+ *
+ * The dependency .mlb is brought in WITHOUT a `local` wrapper so that
+ * consumers (the test suite, examples) can `open BigInt` alongside Asn1. *)
+$(SML_LIB)/basis/basis.mlb
+../lib/github.com/sjqtentacles/sml-bigint/bigint.mlb
+asn1.sig
+asn1.sml

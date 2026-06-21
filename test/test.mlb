@@ -1,0 +1,8 @@
+(* Test executable basis: the asn1 library (which pulls in the vendored
+ * sml-bigint) plus the harness and runner. *)
+$(SML_LIB)/basis/basis.mlb
+../src/asn1.mlb
+harness.sml
+test_asn1.sml
+entry.sml
+main.sml

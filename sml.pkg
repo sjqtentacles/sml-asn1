@@ -1,0 +1,5 @@
+package github.com/sjqtentacles/sml-asn1
+
+require {
+  github.com/sjqtentacles/sml-bigint
+}
