@@ -346,8 +346,9 @@ struct
   (* ----- conversions ----- *)
 
   (* Conversions go through base-2^16 chunks, which fit the host [Int] on every
-     platform (32-bit MLton as well as Poly/ML's arbitrary-precision Int),
-     while the limbs themselves remain base-2^32. *)
+     platform (32-bit MLton as well as Poly/ML's 63-bit Int -- both fixed-width;
+     only IntInf is arbitrary precision), while the limbs themselves remain
+     base-2^32. *)
 
   fun fromInt n =
     if n = 0 then zeroB
@@ -632,6 +633,178 @@ struct
             end
     end
 
+  (* ===== additive extensions ===== *)
+
+  val twoB = fromInt 2
+  val oneMag : mag = Vector.fromList [0w1]
+
+  (* ----- bitwise operations (infinite two's complement) ----- *)
+
+  fun magLimb (m : mag, i) : limb =
+    if i < Vector.length m then Vector.sub (m, i) else 0w0
+
+  (* (isNeg, i-th limb of the infinite two's complement of n).  For a negative
+     value with magnitude m, the two's complement is ~(m - 1), so each limb is
+     the bitwise complement of the corresponding limb of (m - 1); beyond the
+     length of (m - 1) the complement yields all-ones, the correct sign fill. *)
+  fun tcView (BI (s, m)) =
+    if s >= 0 then (false, fn i => magLimb (m, i))
+    else
+      let val m1 = magSub (m, oneMag)
+      in (true, fn i => Word32.notb (magLimb (m1, i))) end
+
+  fun bitwise opf (a as BI (_, ma), b as BI (_, mb)) =
+    let
+      val (na, fa) = tcView a
+      val (nb, fb) = tcView b
+      val extA : limb = if na then 0wxFFFFFFFF else 0w0
+      val extB : limb = if nb then 0wxFFFFFFFF else 0w0
+      val resNeg = opf (extA, extB) = (0wxFFFFFFFF : limb)
+      val n = Int.max (Vector.length ma, Vector.length mb) + 1
+      val r = Array.tabulate (n, fn i => opf (fa i, fb i))
+    in
+      if not resNeg then mk (1, normArr r)
+      else
+        (* result is negative: recover its magnitude as ~r + 1 *)
+        let
+          val res = Array.array (n, 0w0 : limb)
+          fun loop (i, carry) =
+            if i >= n then ()
+            else
+              let val x = Word64.+ (to64 (Word32.notb (Array.sub (r, i))), carry)
+              in Array.update (res, i, to32 x); loop (i + 1, Word64.>> (x, 0w32)) end
+        in
+          loop (0, 0w1); mk (~1, normArr res)
+        end
+    end
+
+  fun andbB (a, b) = bitwise Word32.andb (a, b)
+  fun orbB  (a, b) = bitwise Word32.orb  (a, b)
+  fun xorbB (a, b) = bitwise Word32.xorb (a, b)
+  fun notbB n = negate (add (n, oneB))            (* ~n - 1 *)
+
+  fun shlB (n, k) =
+    if k < 0 then raise Domain
+    else let val BI (s, m) = n in mk (s, shlBits (m, k)) end
+
+  (* Arithmetic (floored) right shift: `shr (n, k) = floor (n / 2^k)`, i.e.
+     `IntInf.div (n, 2^k)`. This is the correct sign-extending shift and matches
+     MLton's `IntInf.~>>`; note Poly/ML 5.9.2's `IntInf.~>>` is buggy for large
+     negatives (it truncates toward zero), so this implementation is the
+     portable, correct one. *)
+  fun shrB (n, k) =
+    if k < 0 then raise Domain
+    else
+      let val BI (s, m) = n
+      in
+        if s >= 0 then mk (s, shrBits (m, k))
+        else
+          let
+            val q = shrBits (m, k)
+            val exact = magCompare (shlBits (q, k), m) = EQUAL
+          in
+            if exact then mk (~1, q) else mk (~1, magAdd (q, oneMag))
+          end
+      end
+
+  fun bitLengthOf (BI (_, m)) = bitLength m
+
+  fun bitB (n, i) =
+    if i < 0 then raise Domain
+    else
+      let
+        val (_, lf) = tcView n
+        val li = Int.div (i, 32) and bi = Int.mod (i, 32)
+      in
+        Word32.andb (Word32.>> (lf li, Word.fromInt bi), 0w1) = 0w1
+      end
+
+  fun setBitB (n, i) = orbB (n, shlB (oneB, i))
+  fun clearBitB (n, i) = if bitB (n, i) then xorbB (n, shlB (oneB, i)) else n
+
+  fun popcountB n =
+    let
+      val BI (_, m) = absB n
+      fun limbPop (w, acc) =
+        if w = 0w0 then acc
+        else limbPop (Word32.>> (w, 0w1),
+                      acc + (if Word32.andb (w, 0w1) = 0w1 then 1 else 0))
+      fun loop (i, acc) =
+        if i >= Vector.length m then acc
+        else loop (i + 1, limbPop (Vector.sub (m, i), acc))
+    in loop (0, 0) end
+
+  (* ----- integer roots ----- *)
+
+  fun isqrtB n =
+    case compare (n, zeroB) of
+        LESS => raise Domain
+      | EQUAL => zeroB
+      | GREATER =>
+          let
+            val bl = bitLengthOf n
+            val x0 = shlB (oneB, Int.div (bl + 1, 2))    (* x0 >= floor(sqrt n) *)
+            fun loop x =
+              let val y = #1 (divMod (add (x, #1 (divMod (n, x))), twoB))
+              in if compare (y, x) = LESS then loop y else x end
+          in loop x0 end
+
+  fun nthRootB (k, n) =
+    if k < 1 then raise Domain
+    else if compare (n, zeroB) = LESS then raise Domain
+    else if k = 1 then n
+    else if compare (n, zeroB) = EQUAL then zeroB
+    else if k = 2 then isqrtB n
+    else
+      let
+        val kB = fromInt k
+        val km1 = fromInt (k - 1)
+        val bl = bitLengthOf n
+        val x0 = shlB (oneB, Int.div (bl + k - 1, k) + 1)    (* upper bound *)
+        fun newton x =
+          let
+            val xk1 = pow (x, km1)
+            val y = #1 (divMod (add (mul (km1, x), #1 (divMod (n, xk1))), kB))
+          in if compare (y, x) = LESS then newton y else x end
+        val approx = newton x0
+        (* tighten to the exact floor with bounded correction steps *)
+        fun down x = if compare (pow (x, kB), n) = GREATER then down (sub (x, oneB)) else x
+        val x1 = down approx
+        fun up x = if compare (pow (add (x, oneB), kB), n) <> GREATER then up (add (x, oneB)) else x
+      in up x1 end
+
+  (* ----- byte serialization (big-endian, unsigned magnitude) ----- *)
+
+  fun toBytesB n =
+    let
+      val BI (_, m) = absB n
+      val nbits = bitLength m
+    in
+      if nbits = 0 then Word8Vector.fromList []
+      else
+        let
+          val nbytes = Int.div (nbits + 7, 8)
+          fun byteAt j =
+            let
+              val idx = nbytes - 1 - j               (* little-endian byte index *)
+              val limbIdx = Int.div (idx, 4)
+              val shift = Int.mod (idx, 4) * 8
+              val w = magLimb (m, limbIdx)
+              val b = Word32.andb (Word32.>> (w, Word.fromInt shift), 0wxFF)
+            in Word8.fromLarge (Word32.toLarge b) end
+        in
+          Word8Vector.tabulate (nbytes, byteAt)
+        end
+    end
+
+  fun fromBytesB v =
+    let
+      val n = Word8Vector.length v
+      fun loop (i, acc) =
+        if i >= n then acc
+        else loop (i + 1, add (shlB (acc, 8), fromInt (Word8.toInt (Word8Vector.sub (v, i)))))
+    in loop (0, zeroB) end
+
   (* ----- public names ----- *)
 
   type int = bigint
@@ -640,4 +813,22 @@ struct
   val op- = sub
   val op* = mul
   val abs = absB
+
+  val isqrt = isqrtB
+  val sqrt = isqrtB
+  val nthRoot = nthRootB
+  val andb = andbB
+  val orb = orbB
+  val xorb = xorbB
+  val notb = notbB
+  val shl = shlB
+  val shr = shrB
+  val bit = bitB
+  val testBit = bitB
+  val setBit = setBitB
+  val clearBit = clearBitB
+  val popcount = popcountB
+  val bitLength = bitLengthOf
+  val toBytes = toBytesB
+  val fromBytes = fromBytesB
 end
