@@ -49,11 +49,10 @@ example: $(BIN)/demo
 $(BIN)/demo: $(SRCS) | $(BIN)
 	$(MLTON) -output $@ examples/sources.mlb
 
-example-poly: $(BIN)/demo-poly
-	./$(BIN)/demo-poly
-
-$(BIN)/demo-poly: $(SRCS) tools/polybuild | $(BIN)
-	sh tools/polybuild -o $@ examples/sources.mlb
+# Demos are top-level scripts (no `main`), so the Poly side runs them via
+# use-loading rather than linking a binary.
+example-poly:
+	sh tools/polybuild -r examples/sources.mlb
 
 $(BIN):
 	mkdir -p $(BIN)
